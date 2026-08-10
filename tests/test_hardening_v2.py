@@ -395,4 +395,8 @@ def test_readme_adapter_example_is_a_nested_mapping():
     assert blocks
     document = yaml.safe_load(blocks[0].split("```", 1)[0])
     adapters = document["plugins"]["entries"]["hermes-skill-publisher"]["adapter_roots"]
-    assert adapters == {"claude": "~/.claude/skills", "codex": "~/.codex/skills"}
+    assert adapters == {
+        "claude": "~/.claude/skills",
+        "codex": "~/.codex/skills",
+        "prime": "~/.prime/agent/skills",
+    }
