@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-skill-publisher"
+version = "0.1.0"
+description = "Safely promote explicitly shared Agent Skills from Hermes"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = {text = "MIT"}
+authors = [{name = "Hermes Skill Publisher contributors"}]
+dependencies = ["PyYAML>=6,<7"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["e2e: isolated integration against a real Hermes checkout"]
+
+[tool.setuptools.packages.find]
+include = ["hermes_skill_publisher*"]
