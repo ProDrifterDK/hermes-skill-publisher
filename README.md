@@ -15,13 +15,13 @@
 ## Install
 
 ```bash
-hermes plugins install OWNER/hermes-skill-publisher --enable
+hermes plugins install ProDrifterDK/hermes-skill-publisher --enable
 hermes config edit
 # Create shared/adapter directories explicitly and configure them as shown below.
 hermes skill-publisher doctor
 ```
 
-Replace `OWNER` with the public repository owner. Plugin or configuration changes require a new Hermes process/session; restart a long-lived gateway. Do not consider publication ready until `doctor` exits `0`.
+Plugin or configuration changes require a new Hermes process/session; restart a long-lived gateway. Do not consider publication ready until `doctor` exits `0`.
 
 ## Classification
 
