@@ -573,7 +573,7 @@ def discover_local(config: PublisherConfig | None = None) -> list[tuple[Path, An
                 skill_files.append(Path(skill_entry.path))
             continue
         for entry in reversed(entries):
-            if entry.name.startswith(".hermes-skill-publisher-"):
+            if entry.name.startswith("."):
                 continue
             try:
                 info = entry.stat(follow_symlinks=False)

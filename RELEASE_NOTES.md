@@ -1,3 +1,7 @@
+# 0.1.1 beta release notes
+
+This patch excludes every dot-prefixed directory tree below the local skills root from publication candidate discovery. Archived and administrative skills no longer appear in `status` or classification warnings, while visible nested categories still work and `doctor` continues to detect unknown transaction artifacts inside hidden trees.
+
 # 0.1.0 beta release notes
 
 This first beta adds policy-governed promotion of explicitly shared Hermes skills into a canonical Agent Skills root. Normal publication waits for a successful, non-interrupted turn boundary. Durable journals recover interrupted promotion/unpublish work without adopting or replacing external objects.

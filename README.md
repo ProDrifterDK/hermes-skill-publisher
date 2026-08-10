@@ -44,6 +44,8 @@ Exact beta values:
 
 `project`, missing values, nested values, and malformed values are invalid. By default, their create call remains local and receives a warning. Set `require_classification: true` to reject such creates before Hermes core runs.
 
+Candidate discovery scans visible nested categories, but does not traverse any dot-prefixed directory or symlinked directory below the local skills root.
+
 ## Configuration
 
 ```yaml

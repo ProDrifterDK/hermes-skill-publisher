@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-skill-publisher"
-version = "0.1.0"
+version = "0.1.1"
 description = "Safely promote explicitly shared Agent Skills from Hermes"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"

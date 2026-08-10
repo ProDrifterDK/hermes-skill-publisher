@@ -1,5 +1,5 @@
 name: hermes-skill-publisher
-version: "0.1.0"
+version: "0.1.1"
 description: Safely promote explicitly shared Agent Skills to a portable canonical root
 author: Hermes Skill Publisher contributors
 kind: standalone

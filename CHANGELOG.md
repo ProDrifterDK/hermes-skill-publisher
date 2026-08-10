@@ -2,7 +2,13 @@
 
 All notable changes are documented here.
 
-## [0.1.0] - Unreleased beta
+## [0.1.1] - 2026-08-10
+
+### Fixed
+
+- Local candidate discovery excludes all dot-prefixed directory trees while preserving visible nested categories and transaction-artifact doctor scans.
+
+## [0.1.0] - 2026-08-10
 
 ### Added
 

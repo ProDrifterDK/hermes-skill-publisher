@@ -41,6 +41,26 @@ def test_doctor_unknown_hidden_artifact_exit_two(isolated_home, capsys, monkeypa
     assert code == 2 and any("unknown hidden" in error for error in value["errors"])
 
 
+def test_hidden_skills_are_absent_but_doctor_still_scans_their_transaction_artifacts(
+    isolated_home, make_skill, capsys, monkeypatch
+):
+    monkeypatch.setattr(plugin, "_MIDDLEWARE_AVAILABLE", True)
+    archive = isolated_home["local"] / ".archive"
+    make_skill(archive, "archived-skill")
+    invalid = isolated_home["local"] / "visible" / ".admin" / "invalid-skill"
+    invalid.mkdir(parents=True)
+    invalid.joinpath("SKILL.md").write_text("not frontmatter", encoding="utf-8")
+
+    assert handle_cli(parse("status", "--json")) == 0
+    assert json.loads(capsys.readouterr().out)["pending"] == []
+
+    archive.joinpath(".hermes-skill-publisher-stage-unknown").mkdir()
+    assert handle_cli(parse("doctor", "--json")) == 2
+    value = json.loads(capsys.readouterr().out)
+    assert value["warnings"] == []
+    assert any("unknown hidden" in error for error in value["errors"])
+
+
 def test_mutation_missing_middleware_exit_two(isolated_home, capsys, monkeypatch):
     monkeypatch.setattr(plugin, "_MIDDLEWARE_AVAILABLE", False)
     code = handle_cli(parse("publish", "demo-skill", "--json"))

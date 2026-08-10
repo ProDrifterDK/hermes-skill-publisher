@@ -5,7 +5,7 @@ import pytest
 
 from hermes_skill_publisher.config import load_config
 from hermes_skill_publisher.filesystem import SafetyError, package_digest
-from hermes_skill_publisher.publisher import PublisherError, promote, publish_pending, recover
+from hermes_skill_publisher.publisher import PublisherError, discover_local, promote, publish_pending, recover
 from hermes_skill_publisher.state import list_journals, load_registry
 
 
@@ -186,6 +186,16 @@ def test_existing_publication_with_duplicate_local_source_blocks(isolated_home, 
     with pytest.raises(PublisherError, match="both exist"):
         promote(duplicate)
     assert duplicate.exists() and (isolated_home["shared"] / "demo-skill").exists()
+
+
+def test_hidden_categories_are_excluded_but_visible_nested_categories_are_discovered(
+    isolated_home, make_skill
+):
+    make_skill(isolated_home["local"], "archived-skill", category=".archive/legacy")
+    make_skill(isolated_home["local"], "administrative-skill", category="visible/.admin")
+    visible = make_skill(isolated_home["local"], "nested-skill", category="visible/nested")
+
+    assert [path for path, _classification in discover_local()] == [visible]
 
 
 def test_symlinked_category_is_not_discovered(isolated_home, make_skill, tmp_path):
