@@ -2,13 +2,13 @@
 
 ## Readiness
 
-Create configured directories yourself, add the canonical directory to active `skills.external_dirs`, enable the plugin, start a new Hermes process, then run:
+Precreate every configured shared and adapter root as a real directory (not a symlink), add the canonical directory to the active profile's `skills.external_dirs`, enable the plugin, start a new Hermes process, then run:
 
 ```bash
 hermes skill-publisher doctor
 ```
 
-Do not publish until it exits `0`. A gateway must be restarted after plugin/config changes.
+Do not publish until it exits `0`. A gateway must be restarted after plugin/config changes. Harness discovery behavior can change by version; verify each installed harness before relying on a native root or configuring an adapter. Discovery does not establish instruction or tool compatibility.
 
 ## Inspect
 

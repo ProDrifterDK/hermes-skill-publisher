@@ -74,9 +74,26 @@ plugins:
       adapter_roots:
         claude: "~/.claude/skills"
         codex: "~/.codex/skills"
+        prime: "~/.prime/agent/skills"
 ```
 
-The plugin never creates configured roots and never edits Hermes configuration. Roots cannot be symlinks or overlap. Any existing canonical or adapter object—including an empty directory, broken symlink, or same-target unowned symlink—is a conflict. There is no force/adopt option.
+Every configured `shared_root` and adapter root must be precreated as a real directory. The plugin never creates configured roots or edits Hermes configuration. Roots cannot be symlinks or overlap. Any existing canonical or adapter object—including an empty directory, broken symlink, or same-target unowned symlink—is a conflict. There is no force/adopt option.
+
+## Harness discovery (verified versions)
+
+“Native” below means the inspected version automatically includes the canonical user root without a publisher adapter. Hermes can consume that root directly when it is configured as an external directory.
+
+| Harness/version | `~/.agents/skills` relationship | Publisher setup |
+|---|---|---|
+| Hermes v2026.7.30+ (plugin scope) | Configured direct root, not an implicit default | Add `~/.agents/skills` to the active profile's `skills.external_dirs`; no per-skill adapter is needed. |
+| PI 0.83.0 | Native user root; project `.agents/skills` roots are also discovered subject to project trust | None for the canonical user root. |
+| OMP 17.2.9 | Native user root; project `.agent/skills` and `.agents/skills` roots are also discovered by walk-up | None for the canonical user root. |
+| Prime Agent inspected source (`package.json` 0.7.1) | Not a default root | Configure an adapter to the default `~/.prime/agent/skills`. |
+| OpenCode 1.18.13 | Native external, auto-loaded user root | None for the canonical user root. |
+| Claude Code 2.1.223 | Not a documented personal-skills root | Configure an adapter to `~/.claude/skills`. |
+| Codex CLI 0.144.5 | Not its documented default skills root | Configure an adapter to `$CODEX_HOME/skills`, defaulting to `~/.codex/skills`. |
+
+These observations are version-scoped. Discovery paths and precedence can change, so operators should verify their installed harness before configuring roots. Discovery alone does not imply compatibility with a skill's instructions, tools, commands, hooks, or plugins.
 
 ## Operator CLI
 
