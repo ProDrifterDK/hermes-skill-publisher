@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import os
 from pathlib import Path
+import stat
 import sys
 import types
 
@@ -62,6 +64,26 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     except ImportError:
         pass
     yield {"home": home, "hermes": hermes, "local": local, "shared": shared, "adapter": adapter, "config": config}
+
+
+def package_digest_oracle(root: Path) -> str:
+    """Independent test oracle for the package digest contract."""
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        info = path.lstat()
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        if stat.S_ISDIR(info.st_mode):
+            kind = "directory"
+        elif stat.S_ISREG(info.st_mode):
+            kind = "file"
+        else:
+            raise AssertionError(f"unexpected package entry: {path}")
+        digest.update(kind.encode("ascii") + b"\0" + relative + b"\0")
+        digest.update((info.st_mode & 0o111).to_bytes(1, "big") + b"\0")
+        if kind == "file":
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
 
 
 def skill_text(name: str, scope: object = "shared", *, description: str = "A portable test skill.") -> str:

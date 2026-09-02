@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from conftest import skill_text
+from conftest import package_digest_oracle, skill_text
 from hermes_skill_publisher.plugin import intercept
 from hermes_skill_publisher.publisher import promote
 
@@ -25,6 +25,98 @@ def test_classified_create_passes_once(isolated_home):
     result = intercept(tool_name="skill_manage", args=args, next_call=lambda value: calls.append(value) or json.dumps({"success": True}))
     assert decode(result) == {"success": True}
     assert calls == [args]
+
+
+def test_one_operation_batch_updates_managed_digest_and_calls_core_once(isolated_home, make_skill):
+    from hermes_skill_publisher.state import load_registry
+    publication = promote(make_skill(isolated_home["local"]))
+    target = Path(publication["canonical_path"])
+    args = {
+        "operations": [{
+            "action": "patch",
+            "name": "demo-skill",
+            "old_string": "Body",
+            "new_string": "Updated",
+        }],
+    }
+    calls = []
+
+    def core(payload):
+        calls.append(payload)
+        skill_md = target / "SKILL.md"
+        skill_md.write_text(skill_md.read_text().replace("Body", "Updated"), encoding="utf-8")
+        return json.dumps({"success": True, "operations_applied": 1})
+
+    before = load_registry()["publications"]["demo-skill"]["digest"]
+    result = decode(intercept(tool_name="skill_manage", args=args, next_call=core))
+    assert result["success"] is True
+    assert calls == [args]
+    after = load_registry()["publications"]["demo-skill"]["digest"]
+    assert after != before
+    assert after == package_digest_oracle(target)
+
+
+def test_batch_policy_rejects_invalid_topology_and_required_unclassified_create(isolated_home):
+    config = isolated_home["config"]
+    config["plugins"]["entries"]["hermes-skill-publisher"]["require_classification"] = True
+    (isolated_home["hermes"] / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    calls = []
+    invalid_content = "---\nname: demo-skill\ndescription: test\n---\nBody\n"
+    invalid = {
+        "operations": [{"action": "create", "name": "demo-skill", "content": invalid_content}],
+    }
+    result = decode(intercept(
+        tool_name="skill_manage", args=invalid,
+        next_call=lambda payload: calls.append(payload) or pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.classification_required"
+    malformed = {"operations": [{"action": "edit", "name": "demo-skill", "content": invalid_content}]}
+    result = decode(intercept(
+        tool_name="skill_manage", args=malformed,
+        next_call=lambda payload: calls.append(payload) or pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.batch_unsupported"
+    assert result["retryable"] is True
+    assert calls == []
+
+
+@pytest.mark.parametrize("operations", [
+    [
+        {"action": "patch", "name": "demo-skill", "old_string": "a", "new_string": "b"},
+        {"action": "patch", "name": "demo-skill", "old_string": "b", "new_string": "c"},
+    ],
+    [
+        {"action": "patch", "name": "demo-skill", "old_string": "a", "new_string": "b"},
+        {"action": "patch", "name": "other-skill", "old_string": "a", "new_string": "b"},
+    ],
+])
+def test_multi_operation_batch_rejected_before_core(isolated_home, operations):
+    calls = []
+    result = decode(intercept(
+        tool_name="skill_manage", args={"operations": operations},
+        next_call=lambda payload: calls.append(payload) or pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.batch_unsupported"
+    assert result["retryable"] is True
+    assert calls == []
+
+
+def test_managed_multi_operation_scope_batch_rejected_before_core(isolated_home, make_skill):
+    promote(make_skill(isolated_home["local"]))
+    calls = []
+    args = {
+        "operations": [
+            {"action": "patch", "name": "demo-skill", "old_string": "Body", "new_string": "Updated"},
+            {"action": "write_file", "name": "demo-skill", "file_path": "references/x.md", "file_content": "x"},
+        ],
+    }
+    result = decode(intercept(
+        tool_name="skill_manage", args=args,
+        next_call=lambda payload: calls.append(payload) or pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.batch_unsupported"
+    assert result["retryable"] is True
+    assert calls == []
 
 
 def test_default_missing_runs_core_and_annotates(isolated_home):
@@ -175,6 +267,48 @@ def test_write_approval_blocks_create_before_staging(isolated_home):
     result = decode(intercept(tool_name="skill_manage", args={"action": "create", "name": "demo-skill", "content": skill_text("demo-skill")}, next_call=lambda _: pytest.fail("core called")))
     assert result["code"] == "skill_publisher.write_approval_incompatible"
     assert result["retryable"] is False
+
+
+def test_write_approval_blocks_batch_before_staging(isolated_home):
+    _enable_write_approval(isolated_home)
+    args = {"operations": [{
+        "action": "patch",
+        "name": "demo-skill",
+        "old_string": "before",
+        "new_string": "after",
+    }]}
+    result = decode(intercept(
+        tool_name="skill_manage", args=args,
+        next_call=lambda _: pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.write_approval_incompatible"
+    assert result["retryable"] is False
+
+
+def test_last_moment_batch_policy_fault_blocks_core(isolated_home, monkeypatch):
+    import hermes_skill_publisher.plugin as plugin
+
+    reads = 0
+
+    def flaky_approval_check():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise RuntimeError("injected config read failure")
+        return False
+
+    monkeypatch.setattr(plugin, "skills_write_approval_enabled", flaky_approval_check)
+    calls = []
+    result = decode(intercept(
+        tool_name="skill_manage",
+        args={"operations": [{
+            "action": "patch", "name": "demo-skill",
+            "old_string": "before", "new_string": "after",
+        }]},
+        next_call=lambda payload: calls.append(payload) or pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.policy_unavailable"
+    assert calls == []
 
 
 def test_write_approval_blocks_managed_mutation(isolated_home, make_skill):
@@ -345,5 +479,13 @@ def test_malformed_yaml_sentinel_never_persisted(isolated_home, capsys):
     assert sentinel not in json.dumps(result)
     from hermes_skill_publisher.plugin import on_post_tool_call
     on_post_tool_call(tool_name="skill_manage", args={"action": "create", "name": "demo-skill"}, status="error", error_message=f"core failed with {sentinel} inside")
+    on_post_tool_call(
+        tool_name="skill_manage",
+        args={"operations": [{
+            "action": "patch", "name": "demo-skill",
+            "old_string": sentinel, "new_string": "replacement",
+        }]},
+        status="error", error_message=f"core failed with {sentinel} inside",
+    )
     audit_text = json.dumps(read_audit(50))
     assert sentinel not in audit_text

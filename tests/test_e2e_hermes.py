@@ -10,7 +10,7 @@ import sys
 import pytest
 import yaml
 
-from conftest import skill_text
+from conftest import package_digest_oracle, skill_text
 
 
 def _hermes_host(isolated_home, monkeypatch):
@@ -83,6 +83,49 @@ def test_real_hermes_discovery_middleware_lifecycle_and_cli(isolated_home, monke
     blocked = _run_cli(source, "skill-publisher", "publish", "missing-skill", "--json")
     assert blocked.returncode == 2, blocked.stdout + blocked.stderr
     assert not json.loads(blocked.stdout)["ok"]
+
+
+@pytest.mark.e2e
+def test_real_host_one_operation_batch_updates_managed_digest(isolated_home, monkeypatch):
+    source, manager = _hermes_host(isolated_home, monkeypatch)
+    from hermes_cli.middleware import run_tool_execution_middleware
+    from hermes_skill_publisher.publisher import reconcile
+    from hermes_skill_publisher.state import load_registry
+    from tools.skill_manager_tool import skill_manage
+    import inspect
+    if "operations" not in inspect.signature(skill_manage).parameters:
+        pytest.skip("Hermes host does not expose the operations[] skill_manage shape")
+
+    create = {"action": "create", "name": "demo-skill", "content": skill_text("demo-skill")}
+    assert json.loads(run_tool_execution_middleware(
+        "skill_manage", create, lambda payload: skill_manage(**payload)
+    ))["success"]
+    manager.invoke_hook("on_session_end", session_id="e2e-batch", completed=True, interrupted=False)
+    target = isolated_home["shared"] / "demo-skill"
+    before = load_registry()["publications"]["demo-skill"]["digest"]
+    payload = {
+        "operations": [{
+            "action": "patch",
+            "name": "demo-skill",
+            "old_string": "Body",
+            "new_string": "Updated",
+        }],
+    }
+    calls = []
+
+    def terminal(args):
+        calls.append(args)
+        return skill_manage(action="", name="", **args)
+
+    result = json.loads(run_tool_execution_middleware("skill_manage", payload, terminal))
+    assert result["success"] is True
+    assert calls == [payload]
+    after = load_registry()["publications"]["demo-skill"]["digest"]
+    assert after != before
+    assert after == package_digest_oracle(target)
+    assert not any(item.get("result") == "drift" for item in reconcile())
+    doctor = _run_cli(source, "skill-publisher", "doctor", "--json")
+    assert doctor.returncode == 0, doctor.stdout + doctor.stderr
 
 
 @pytest.mark.e2e

@@ -17,6 +17,122 @@ _MIDDLEWARE_AVAILABLE = False
 # Actions that mutate skill state and therefore pass through the host
 # write-approval gate when it is enabled.
 _WRITE_ACTIONS = {"create", "edit", "patch", "delete", "write_file", "remove_file"}
+_BATCH_ACTIONS = {"create", "patch", "delete", "write_file", "remove_file"}
+_BATCH_MAX_OPS = 20
+
+
+class _BatchShapeError(ValueError):
+    """A batch envelope cannot be safely interpreted by this middleware."""
+
+
+def _is_write_action(action: Any) -> bool:
+    return isinstance(action, str) and action in _WRITE_ACTIONS
+
+
+def _batch_rejection(message: str) -> str:
+    return json.dumps(
+        {
+            "success": False,
+            "error": message,
+            "code": "skill_publisher.batch_unsupported",
+            "retryable": True,
+            "skill_publisher": {
+                "retry_action": "Retry skill_manage with a supported operations array or legacy flat shape.",
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+def _parse_skill_manage_args(
+    args: Any,
+) -> tuple[bool, tuple[dict[str, Any], ...], Any, Any]:
+    """Extract policy metadata without changing the payload sent to Hermes.
+
+    Current Hermes advertises only ``operations``.  Keep the legacy flat
+    shape untouched, but reject ambiguous or unsafe envelopes before core is
+    called.  The host owns batch execution and rollback, so this parser never
+    splits or replays operations.
+    """
+    if not isinstance(args, dict):
+        raise _BatchShapeError("skill_manage arguments must be an object")
+    if "operations" not in args:
+        return False, (args,), args.get("action"), args.get("name")
+
+    # The current schema has no flat fields. Empty defaults and the host's
+    # explicit ``action='batch'`` marker are tolerated for compatibility,
+    # while other duplicates are ambiguous.
+    if any(key not in {"operations", "action", "name"} for key in args):
+        raise _BatchShapeError("operations batches cannot contain flat or unknown fields")
+    if args.get("action") not in (None, "", "batch") or args.get("name") not in (None, ""):
+        raise _BatchShapeError("operations batches cannot mix top-level action/name with operations")
+
+    operations = args.get("operations")
+    if not isinstance(operations, list) or not operations:
+        raise _BatchShapeError("operations must be a non-empty array")
+    if len(operations) > _BATCH_MAX_OPS:
+        raise _BatchShapeError(f"operations is capped at {_BATCH_MAX_OPS} ops per call")
+    if len(operations) != 1:
+        raise _BatchShapeError(
+            "only single-operation batches are supported; retry each operation separately"
+        )
+
+    normalized: list[dict[str, Any]] = []
+    names: list[str] = []
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, dict):
+            raise _BatchShapeError(f"operations[{index}] must be an object")
+        if "operations" in operation:
+            raise _BatchShapeError(f"operations[{index}] cannot contain a nested operations array")
+        action = operation.get("action")
+        name = operation.get("name")
+        if not isinstance(action, str) or not action:
+            raise _BatchShapeError(f"operations[{index}] requires a string action")
+        if action not in _BATCH_ACTIONS:
+            raise _BatchShapeError(f"operations[{index}] uses an unsupported action")
+        if not isinstance(name, str) or not name:
+            raise _BatchShapeError(f"operations[{index}] requires a string name")
+        if operation.get("category") is not None and not isinstance(operation.get("category"), str):
+            raise _BatchShapeError(f"operations[{index}] category must be a string")
+        if action == "create" and not isinstance(operation.get("content"), str):
+            raise _BatchShapeError(f"operations[{index}] create requires string content")
+        if action == "patch":
+            content = operation.get("content")
+            if content is not None and not isinstance(content, str):
+                raise _BatchShapeError(f"operations[{index}] patch content must be a string")
+            file_path = operation.get("file_path")
+            if file_path is not None and not isinstance(file_path, str):
+                raise _BatchShapeError(f"operations[{index}] patch file_path must be a string")
+            replace_all = operation.get("replace_all", False)
+            if not isinstance(replace_all, bool):
+                raise _BatchShapeError(f"operations[{index}] patch replace_all must be boolean")
+            full_rewrite = bool(content)
+            if full_rewrite:
+                if operation.get("old_string") is not None or operation.get("new_string") is not None:
+                    raise _BatchShapeError(f"operations[{index}] patch must choose content or old/new strings")
+            elif not isinstance(operation.get("old_string"), str) or not operation.get("old_string"):
+                raise _BatchShapeError(f"operations[{index}] patch requires old_string")
+            elif not isinstance(operation.get("new_string"), str):
+                raise _BatchShapeError(f"operations[{index}] patch requires string new_string")
+        elif action == "write_file":
+            if not isinstance(operation.get("file_path"), str) or not operation.get("file_path"):
+                raise _BatchShapeError(f"operations[{index}] write_file requires file_path")
+            if not isinstance(operation.get("file_content"), str):
+                raise _BatchShapeError(f"operations[{index}] write_file requires string file_content")
+        elif action == "remove_file":
+            if not isinstance(operation.get("file_path"), str) or not operation.get("file_path"):
+                raise _BatchShapeError(f"operations[{index}] remove_file requires file_path")
+        elif action == "delete":
+            absorbed_into = operation.get("absorbed_into")
+            if absorbed_into is not None and not isinstance(absorbed_into, str):
+                raise _BatchShapeError("delete absorbed_into must be a string")
+
+        normalized.append(operation)
+        names.append(name)
+
+    if len(set(names)) != 1:
+        raise _BatchShapeError("a batch must target exactly one skill")
+    return True, tuple(normalized), normalized[0]["action"], names[0]
 
 
 def middleware_available() -> bool:
@@ -122,26 +238,88 @@ def _write_approval_rejection() -> str:
     )
 
 
-def _call_downstream(args: dict[str, Any], next_call: Callable[[dict[str, Any]], Any]) -> Any:
+def _call_downstream(
+    args: dict[str, Any],
+    next_call: Callable[[dict[str, Any]], Any],
+    *,
+    force_write: bool = False,
+) -> Any:
     """Call core without permitting a concurrent approval toggle to stage replay.
 
     The entry check rejects an already-enabled gate. This last-moment check
     catches ordinary config changes; the host ContextVar closes the remaining
     check/use gap so a later toggle executes directly under this middleware
-    rather than creating an out-of-band pending replay.
+    rather than creating an out-of-band pending replay. ``force_write`` is
+    used for the host's operations-array envelope, whose mutation action lives
+    inside the payload rather than at the top level.
     """
-    if args.get("action") not in _WRITE_ACTIONS:
+    if not force_write and not _is_write_action(args.get("action")):
         return next_call(args)
-    if skills_write_approval_enabled():
-        return _write_approval_rejection()
-    if not write_gate_bypass_available():
-        return _policy_rejection("The host skill write-gate compatibility capability is unavailable; the mutation was not attempted.")
-    from tools.skill_manager_tool import _skill_gate_bypass
-    token = _skill_gate_bypass.set(True)
+    try:
+        if skills_write_approval_enabled():
+            return _write_approval_rejection()
+        if not write_gate_bypass_available():
+            return _policy_rejection("The host skill write-gate compatibility capability is unavailable; the mutation was not attempted.")
+        from tools.skill_manager_tool import _skill_gate_bypass
+        token = _skill_gate_bypass.set(True)
+    except Exception:
+        return _policy_rejection("Skill publication policy is unavailable; the mutation was not attempted.")
     try:
         return next_call(args)
     finally:
         _skill_gate_bypass.reset(token)
+
+
+def _operation_targets_skill_md(operation: dict[str, Any]) -> bool:
+    """Return whether a batch operation can change the canonical SKILL.md."""
+    action = operation.get("action")
+    if action == "create":
+        return True
+    if action == "patch" and operation.get("content"):
+        return True
+    if action not in {"patch", "write_file", "remove_file"}:
+        return False
+    file_path = operation.get("file_path")
+    if not file_path:
+        return True
+    return isinstance(file_path, str) and Path(file_path).name == "SKILL.md"
+
+
+def _classify_batch_creates(
+    operations: tuple[dict[str, Any], ...],
+    *,
+    required: bool,
+    name: Any,
+) -> tuple[list[Any], str | None]:
+    """Classify every create before the host can execute any batch operation."""
+    classifications: list[Any] = []
+    for operation in operations:
+        if operation.get("action") != "create":
+            continue
+        try:
+            classification = classify_content(operation.get("content"))
+        except Exception:
+            return classifications, "Skill classification policy failed; creation was not attempted."
+        classifications.append(classification)
+        if required and not classification.classified:
+            _audit_safe(
+                "skill_publisher.create_rejected",
+                result="blocked",
+                error=classification.reason,
+                skill_name=name,
+                classification=classification.value,
+                action="create",
+            )
+            return classifications, "classification"
+    return classifications, None
+
+
+def _annotate_batch(value: Any, classifications: list[Any]) -> Any:
+    """Keep flat-style local classification guidance for a successful batch."""
+    for classification in classifications:
+        if not classification.classified:
+            return _annotate(value, classification)
+    return value
 
 
 def _annotate(value: Any, classification, *, degraded: str | None = None) -> Any:
@@ -210,12 +388,21 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
     """Deterministic `skill_manage` execution middleware; downstream is called at most once."""
     if tool_name != "skill_manage":
         return next_call(args)
-    action = args.get("action")
-    name = args.get("name")
+    try:
+        is_batch, operations, action, name = _parse_skill_manage_args(args)
+    except _BatchShapeError as exc:
+        _audit_safe(
+            "skill_publisher.managed_mutation_blocked",
+            result="blocked",
+            error=str(exc),
+            code="skill_publisher.batch_unsupported",
+        )
+        return _batch_rejection(str(exc))
 
     # The host falls through to the core tool when a middleware callback
     # raises before next_call, so the entire policy surface is resolved inside
     # this boundary and every failure returns a fail-closed JSON result.
+    write_action = is_batch or _is_write_action(action)
     try:
         required = require_classification_policy()
         approval_gate = skills_write_approval_enabled()
@@ -225,17 +412,35 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
 
     # The private replay-bypass ContextVar is required to close the approval
     # config check/use race. Host drift must block rather than call core.
-    if action in _WRITE_ACTIONS and not write_gate_bypass_available():
+    if write_action and not write_gate_bypass_available():
         _audit_safe("skill_publisher.policy_unavailable", result="blocked", skill_name=name, action=action, code="skill_publisher.write_gate_capability_unavailable")
         return _policy_rejection("The host skill write-gate compatibility capability is unavailable; the mutation was not attempted.")
 
     # Approved skill writes replay through a gate-bypass path that skips this
     # middleware, so no skill write may even stage while the gate is enabled.
-    if approval_gate and action in _WRITE_ACTIONS:
+    if approval_gate and write_action:
         _audit_safe("skill_publisher.write_approval_incompatible", result="blocked", skill_name=name, action=action, code="skill_publisher.write_approval_incompatible")
         return _write_approval_rejection()
 
-    if action == "create":
+    classifications: list[Any] = []
+    if is_batch:
+        classifications, classification_error = _classify_batch_creates(
+            operations, required=required, name=name,
+        )
+        if classification_error == "classification":
+            return _rejection(classifications[-1])
+        if classification_error:
+            _audit_safe(
+                "skill_publisher.policy_unavailable",
+                result="blocked",
+                error=classification_error,
+                skill_name=name,
+                action=action,
+                code="skill_publisher.policy_unavailable",
+            )
+            return _policy_rejection(classification_error)
+
+    if not is_batch and action == "create":
         downstream_failed = False
         try:
             classification = classify_content(args.get("content"))
@@ -281,7 +486,8 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
         if barrier:
             _audit_safe("skill_publisher.transaction_in_progress", result="blocked", error=barrier, skill_name=name, action=action, code="skill_publisher.transaction_in_progress")
             return _barrier_rejection(barrier)
-        return _call_downstream(args, next_call)
+        result = _call_downstream(args, next_call, force_write=is_batch)
+        return _annotate_batch(result, classifications) if is_batch else result
 
     downstream_failed = False
     try:
@@ -303,7 +509,7 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
                 if current != publication:
                     raise PublisherError("registry ownership changed before managed delete")
                 try:
-                    result = _call_downstream(args, next_call)
+                    result = _call_downstream(args, next_call, force_write=is_batch)
                 except BaseException:
                     downstream_failed = True
                     raise
@@ -324,10 +530,15 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
             if target != config.shared_root / str(name):
                 raise PublisherError("canonical ownership path drift")
             verify_host_target(str(name), target, config)
-            protects_skill_md = action == "edit" or (
-                action in {"patch", "write_file", "remove_file"}
-                and (not args.get("file_path") or Path(str(args.get("file_path"))).name == "SKILL.md")
-            )
+            if is_batch:
+                protects_skill_md = any(
+                    _operation_targets_skill_md(operation) for operation in operations
+                )
+            else:
+                protects_skill_md = action == "edit" or (
+                    action in {"patch", "write_file", "remove_file"}
+                    and (not args.get("file_path") or Path(str(args.get("file_path"))).name == "SKILL.md")
+                )
             original = expected = None
             original_mode = 0
             skill_md = target / "SKILL.md"
@@ -338,7 +549,7 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
                 original = skill_md.read_bytes()
                 original_mode = info.st_mode
             try:
-                result = _call_downstream(args, next_call)
+                result = _call_downstream(args, next_call, force_write=is_batch)
             except BaseException:
                 downstream_failed = True
                 raise
@@ -355,9 +566,14 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
                     _audit_safe("skill_publisher.scope_change_rolled_back", result="blocked", error=str(exc), skill_name=name, action=action, code="skill_publisher.scope_change_requires_unpublish")
                     changed = expected.decode("utf-8", errors="replace") if expected is not None else ""
                     return _rejection(classify_content(changed), "skill_publisher.scope_change_requires_unpublish", "Published SKILL.md must remain valid and shared. Use `hermes skill-publisher unpublish` to change scope.")
-            if action in {"edit", "patch", "write_file", "remove_file"}:
+            digest_actions = (
+                {operation.get("action") for operation in operations}
+                if is_batch
+                else {action}
+            )
+            if digest_actions & {"edit", "patch", "write_file", "remove_file"}:
                 update_managed_digest(str(name), config=config, _locked=True)
-            return result
+            return _annotate_batch(result, classifications) if is_batch else result
     except Exception as exc:
         if downstream_failed:
             raise
@@ -370,15 +586,26 @@ def on_post_tool_call(**kwargs: Any) -> None:
     if kwargs.get("tool_name") != "skill_manage":
         return
     args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
+    name = args.get("name")
+    action = args.get("action")
+    if "operations" in args:
+        try:
+            _, operations, _, name = _parse_skill_manage_args(args)
+            actions = {operation.get("action") for operation in operations}
+            action = next(iter(actions)) if len(actions) == 1 else None
+        except _BatchShapeError:
+            name = None
+            action = None
     # Downstream error text may embed skill content; audit only that an error
-    # occurred, never the raw message.
+    # occurred, never the raw message. Batch operations are summarized without
+    # copying any operation payload into the audit record.
     _audit_safe(
         "skill_publisher.tool_observed",
         result=str(kwargs.get("status") or "observed")[:100],
         error="downstream tool error observed" if kwargs.get("error_message") else None,
         session_id=kwargs.get("session_id"),
-        skill_name=args.get("name"),
-        action=args.get("action"),
+        skill_name=name,
+        action=action if isinstance(action, str) else None,
     )
 
 

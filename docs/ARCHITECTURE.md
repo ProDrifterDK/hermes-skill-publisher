@@ -8,7 +8,7 @@ All profile paths are resolved at callback time. Runtime state lives below the a
 
 ## Data flow
 
-1. Middleware classifies `skill_manage(create)` from supplied `content` and calls Hermes core at most once. The entire classification/policy surface sits inside a fail-closed boundary: the host falls through to the core tool if a middleware callback raises before `next_call`, so parser or policy faults return a retryable JSON blocker instead.
+1. Middleware classifies `skill_manage(create)` from supplied `content` and calls Hermes core at most once. Current Hermes `operations` batches are parsed before policy checks; supported single-operation batches retain the original envelope and call core once, while ambiguous or multi-operation batches are rejected before core because host rollback exceptions cannot be safely composed with registry ownership updates. The entire classification/policy surface sits inside a fail-closed boundary: the host falls through to the core tool if a middleware callback raises before `next_call`, so parser or policy faults return a retryable JSON blocker instead.
 2. Core creates only in the active local skills root.
 3. A successful, non-interrupted end boundary scans disk for explicit `shared` candidates.
 4. Publication validates, stages, parks local state, rehashes the parked backup (a concurrent late write is restored and restaged, never stale-committed), commits canonical state, creates adapters, commits registry ownership, and removes the local backup.
