@@ -26,7 +26,7 @@ def _hermes_host(isolated_home, monkeypatch):
 
     repo = Path(__file__).resolve().parents[1]
     installed = isolated_home["hermes"] / "plugins" / "hermes-skill-publisher"
-    shutil.copytree(repo, installed, ignore=shutil.ignore_patterns(".git", ".pi-subagents", "__pycache__", ".pytest_cache"))
+    shutil.copytree(repo, installed, ignore=shutil.ignore_patterns(".git", ".pi-subagents", ".codegraph", "__pycache__", ".pytest_cache"))
 
     from hermes_cli.plugins import PluginManager
     import hermes_cli.plugins as plugins
