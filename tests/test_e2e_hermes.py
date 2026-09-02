@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -91,15 +92,32 @@ def test_real_host_one_operation_batch_updates_managed_digest(isolated_home, mon
     from hermes_cli.middleware import run_tool_execution_middleware
     from hermes_skill_publisher.publisher import reconcile
     from hermes_skill_publisher.state import load_registry
+    from tools.registry import registry
     from tools.skill_manager_tool import skill_manage
     import inspect
     if "operations" not in inspect.signature(skill_manage).parameters:
         pytest.skip("Hermes host does not expose the operations[] skill_manage shape")
+    entry = registry.get_entry("skill_manage")
+    assert entry is not None
+    schema = entry.schema
+    parameters = schema["parameters"]
+    assert parameters["type"] == "object"
+    assert parameters["required"] == ["operations"]
+    assert set(parameters["properties"]) == {"operations"}
+    operations_schema = parameters["properties"]["operations"]
+    assert operations_schema["type"] == "array"
+    operation_schema = operations_schema["items"]
+    assert operation_schema["type"] == "object"
+    assert operation_schema["required"] == ["name", "action"]
+    assert operation_schema["properties"]["action"]["enum"] == [
+        "create", "patch", "delete", "write_file", "remove_file",
+    ]
 
     create = {"action": "create", "name": "demo-skill", "content": skill_text("demo-skill")}
-    assert json.loads(run_tool_execution_middleware(
-        "skill_manage", create, lambda payload: skill_manage(**payload)
-    ))["success"]
+    def dispatch(payload):
+        return registry.dispatch("skill_manage", payload)
+
+    assert json.loads(run_tool_execution_middleware("skill_manage", create, dispatch))["success"]
     manager.invoke_hook("on_session_end", session_id="e2e-batch", completed=True, interrupted=False)
     target = isolated_home["shared"] / "demo-skill"
     before = load_registry()["publications"]["demo-skill"]["digest"]
@@ -111,15 +129,17 @@ def test_real_host_one_operation_batch_updates_managed_digest(isolated_home, mon
             "new_string": "Updated",
         }],
     }
+    expected = copy.deepcopy(payload)
     calls = []
 
     def terminal(args):
-        calls.append(args)
-        return skill_manage(action="", name="", **args)
+        calls.append(copy.deepcopy(args))
+        return registry.dispatch("skill_manage", args)
 
     result = json.loads(run_tool_execution_middleware("skill_manage", payload, terminal))
     assert result["success"] is True
-    assert calls == [payload]
+    assert payload == expected
+    assert calls == [expected]
     after = load_registry()["publications"]["demo-skill"]["digest"]
     assert after != before
     assert after == package_digest_oracle(target)
@@ -385,3 +405,84 @@ def test_real_host_crash_then_resumed_turn_recovers_via_pre_llm_call(isolated_ho
     manager.invoke_hook("pre_llm_call", session_id="e2e", task_id="t", turn_id="1", user_message="hi", conversation_history=[], is_first_turn=False, model="m", platform="cli", parent_session_id="", sender_id="")
     assert (isolated_home["shared"] / "demo-skill").is_dir()
     assert (isolated_home["adapter"] / "demo-skill").is_symlink()
+
+
+@pytest.mark.e2e
+def test_real_host_reset_fault_reconciles_digest_and_latches_writes(isolated_home, monkeypatch):
+    source, manager = _hermes_host(isolated_home, monkeypatch)
+    callback = manager._middleware["tool_execution"][0]
+    module = sys.modules[callback.__module__]
+    monkeypatch.setattr(module, "_WRITE_GATE_CAPABILITY_FAILED", False)
+    from hermes_cli.middleware import run_tool_execution_middleware
+    from hermes_skill_publisher.state import load_registry, read_audit
+    from tools.registry import registry
+    import contextvars
+    import tools.skill_manager_tool as skill_tool
+
+    gate = skill_tool._skill_gate_bypass
+    assert isinstance(gate, contextvars.ContextVar)
+
+    def dispatch(payload):
+        return registry.dispatch("skill_manage", payload)
+
+    create = {"action": "create", "name": "demo-skill", "content": skill_text("demo-skill")}
+    assert json.loads(run_tool_execution_middleware("skill_manage", create, dispatch))["success"]
+    manager.invoke_hook("on_session_end", session_id="e2e-reset-fault", completed=True, interrupted=False)
+    target = isolated_home["shared"] / "demo-skill"
+    before = load_registry()["publications"]["demo-skill"]["digest"]
+    payload = {
+        "operations": [{
+            "action": "patch",
+            "name": "demo-skill",
+            "old_string": "Body",
+            "new_string": "Updated",
+        }],
+    }
+    expected = copy.deepcopy(payload)
+    calls = []
+
+    def injected_reset(actual_gate, token):
+        assert actual_gate is gate
+        raise RuntimeError("injected reset failure")
+
+    monkeypatch.setattr(module, "_reset_write_gate", injected_reset)
+
+    def terminal(args):
+        calls.append(copy.deepcopy(args))
+        return dispatch(args)
+
+    result = json.loads(run_tool_execution_middleware("skill_manage", payload, terminal))
+    assert result["success"] is True
+    assert payload == expected
+    assert calls == [expected]
+    assert "Updated" in target.joinpath("SKILL.md").read_text()
+    after = load_registry()["publications"]["demo-skill"]["digest"]
+    assert after != before
+    assert after == package_digest_oracle(target)
+    audit_records = read_audit(50)
+    assert any(
+        item.get("event") == "skill_publisher.policy_unavailable"
+        and item.get("code") == "skill_publisher.write_gate_reset_failed"
+        and "injected reset failure" not in json.dumps(item)
+        for item in audit_records
+    )
+    assert gate.get() is False
+
+    future_payload = {
+        "operations": [{
+            "action": "patch",
+            "name": "demo-skill",
+            "old_string": "Updated",
+            "new_string": "Future",
+        }],
+    }
+    future_calls = []
+    future_result = json.loads(run_tool_execution_middleware(
+        "skill_manage",
+        future_payload,
+        lambda args: future_calls.append(copy.deepcopy(args)) or dispatch(args),
+    ))
+    assert future_result["success"] is False
+    assert future_result["code"] == "skill_publisher.policy_unavailable"
+    assert future_calls == []
+    assert module.write_gate_bypass_available() is False

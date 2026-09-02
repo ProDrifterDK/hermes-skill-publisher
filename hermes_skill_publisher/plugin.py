@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 from pathlib import Path
 import secrets
+import threading
 from typing import Any, Callable
 
 from .config import load_config, require_classification_policy, skills_write_approval_enabled
@@ -13,6 +15,8 @@ from .frontmatter import ALLOWED_SCOPES, FIELD, Classification, classify_content
 from .state import audit, load_registry, state_lock_path, validate_publication
 
 _MIDDLEWARE_AVAILABLE = False
+_WRITE_GATE_CAPABILITY_FAILED = False
+_WRITE_GATE_CAPABILITY_LOCK = threading.Lock()
 
 # Actions that mutate skill state and therefore pass through the host
 # write-approval gate when it is enabled.
@@ -139,14 +143,61 @@ def middleware_available() -> bool:
     return _MIDDLEWARE_AVAILABLE
 
 
-def write_gate_bypass_available() -> bool:
-    """Return whether the required Hermes replay-bypass ContextVar is intact."""
+def _write_gate_failure_latched() -> bool:
+    with _WRITE_GATE_CAPABILITY_LOCK:
+        return _WRITE_GATE_CAPABILITY_FAILED
+
+
+def _latch_write_gate_failure(code: str) -> None:
+    """Disable future writes after a host gate capability fault."""
+    global _WRITE_GATE_CAPABILITY_FAILED
+    with _WRITE_GATE_CAPABILITY_LOCK:
+        if _WRITE_GATE_CAPABILITY_FAILED:
+            return
+        _WRITE_GATE_CAPABILITY_FAILED = True
+    # Keep this record bounded and content-free. The persisted audit sanitizer
+    # also drops any metadata that is not an approved scalar field.
+    try:
+        _audit_safe("skill_publisher.policy_unavailable", result="blocked", code=code)
+    except BaseException:
+        pass
+
+
+def _capture_write_gate() -> contextvars.ContextVar | None:
+    """Capture and validate the exact host ContextVar used by skill_manage."""
+    if _write_gate_failure_latched():
+        return None
     try:
         from tools import skill_manager_tool
         gate = getattr(skill_manager_tool, "_skill_gate_bypass", None)
-    except Exception:
-        return False
-    return all(callable(getattr(gate, method, None)) for method in ("get", "set", "reset"))
+        if not isinstance(gate, contextvars.ContextVar):
+            return None
+        if not all(callable(getattr(gate, method, None)) for method in ("get", "set", "reset")):
+            return None
+        return gate
+    except BaseException:
+        return None
+
+
+def write_gate_bypass_available() -> bool:
+    """Return whether the required Hermes replay-bypass ContextVar is intact."""
+    return _capture_write_gate() is not None
+
+
+def _best_effort_clear_write_gate(gate: contextvars.ContextVar) -> None:
+    try:
+        gate.set(False)
+    except BaseException:
+        pass
+
+
+def _reset_write_gate(gate: contextvars.ContextVar, token: Any) -> None:
+    gate.reset(token)
+
+
+def _handle_write_gate_failure(gate: contextvars.ContextVar, code: str) -> None:
+    _best_effort_clear_write_gate(gate)
+    _latch_write_gate_failure(code)
 
 
 def _audit_safe(event: str, **fields: Any) -> None:
@@ -243,6 +294,7 @@ def _call_downstream(
     next_call: Callable[[dict[str, Any]], Any],
     *,
     force_write: bool = False,
+    write_gate: contextvars.ContextVar | None = None,
 ) -> Any:
     """Call core without permitting a concurrent approval toggle to stage replay.
 
@@ -258,16 +310,32 @@ def _call_downstream(
     try:
         if skills_write_approval_enabled():
             return _write_approval_rejection()
-        if not write_gate_bypass_available():
-            return _policy_rejection("The host skill write-gate compatibility capability is unavailable; the mutation was not attempted.")
-        from tools.skill_manager_tool import _skill_gate_bypass
-        token = _skill_gate_bypass.set(True)
     except Exception:
         return _policy_rejection("Skill publication policy is unavailable; the mutation was not attempted.")
+    if write_gate is None:
+        write_gate = _capture_write_gate()
+    if write_gate is None:
+        return _policy_rejection("The host skill write-gate compatibility capability is unavailable; the mutation was not attempted.")
     try:
-        return next_call(args)
-    finally:
-        _skill_gate_bypass.reset(token)
+        token = write_gate.set(True)
+    except BaseException:
+        _handle_write_gate_failure(write_gate, "skill_publisher.write_gate_set_failed")
+        return _policy_rejection("Skill publication policy is unavailable; the mutation was not attempted.")
+    try:
+        result = next_call(args)
+    except BaseException:
+        try:
+            _reset_write_gate(write_gate, token)
+        except BaseException:
+            _handle_write_gate_failure(write_gate, "skill_publisher.write_gate_reset_failed")
+        raise
+    try:
+        _reset_write_gate(write_gate, token)
+    except BaseException:
+        # A cleanup fault must not skip managed scope/digest reconciliation.
+        # Keep the successful core result and fail closed for later writes.
+        _handle_write_gate_failure(write_gate, "skill_publisher.write_gate_reset_failed")
+    return result
 
 
 def _operation_targets_skill_md(operation: dict[str, Any]) -> bool:
@@ -314,10 +382,26 @@ def _classify_batch_creates(
     return classifications, None
 
 
-def _annotate_batch(value: Any, classifications: list[Any]) -> Any:
-    """Keep flat-style local classification guidance for a successful batch."""
+def _classification_audit_code(classification: Any) -> str:
+    return (
+        "skill_publisher.classification_missing"
+        if classification.status == "missing"
+        else "skill_publisher.classification_invalid"
+    )
+
+
+def _annotate_batch(value: Any, classifications: list[Any], *, name: Any = None) -> Any:
+    """Keep flat-style local classification guidance for a batch result."""
     for classification in classifications:
         if not classification.classified:
+            _audit_safe(
+                "skill_publisher.local_unclassified",
+                result="local",
+                error=classification.reason,
+                skill_name=name,
+                action="create",
+                code=_classification_audit_code(classification),
+            )
             return _annotate(value, classification)
     return value
 
@@ -411,10 +495,14 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
         return _policy_rejection("Skill publication policy is unavailable; the mutation was not attempted.")
 
     # The private replay-bypass ContextVar is required to close the approval
-    # config check/use race. Host drift must block rather than call core.
-    if write_action and not write_gate_bypass_available():
-        _audit_safe("skill_publisher.policy_unavailable", result="blocked", skill_name=name, action=action, code="skill_publisher.write_gate_capability_unavailable")
-        return _policy_rejection("The host skill write-gate compatibility capability is unavailable; the mutation was not attempted.")
+    # config check/use race. Capture the same object that will set/reset the
+    # bypass; host drift must block rather than call core.
+    write_gate = None
+    if write_action:
+        write_gate = _capture_write_gate()
+        if write_gate is None:
+            _audit_safe("skill_publisher.policy_unavailable", result="blocked", skill_name=name, action=action, code="skill_publisher.write_gate_capability_unavailable")
+            return _policy_rejection("The host skill write-gate compatibility capability is unavailable; the mutation was not attempted.")
 
     # Approved skill writes replay through a gate-bypass path that skips this
     # middleware, so no skill write may even stage while the gate is enabled.
@@ -453,12 +541,12 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
                 _audit_safe("skill_publisher.transaction_in_progress", result="blocked", error=barrier, skill_name=name, action=action, code="skill_publisher.transaction_in_progress")
                 return _barrier_rejection(barrier)
             try:
-                result = _call_downstream(args, next_call)
+                result = _call_downstream(args, next_call, write_gate=write_gate)
             except BaseException:
                 downstream_failed = True
                 raise
             if not classification.classified:
-                _audit_safe("skill_publisher.local_unclassified", result="local", error=classification.reason, skill_name=name, action="create", code=("skill_publisher.classification_missing" if classification.status == "missing" else "skill_publisher.classification_invalid"))
+                _audit_safe("skill_publisher.local_unclassified", result="local", error=classification.reason, skill_name=name, action="create", code=_classification_audit_code(classification))
                 return _annotate(result, classification)
             return result
         except Exception as exc:
@@ -486,8 +574,8 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
         if barrier:
             _audit_safe("skill_publisher.transaction_in_progress", result="blocked", error=barrier, skill_name=name, action=action, code="skill_publisher.transaction_in_progress")
             return _barrier_rejection(barrier)
-        result = _call_downstream(args, next_call, force_write=is_batch)
-        return _annotate_batch(result, classifications) if is_batch else result
+        result = _call_downstream(args, next_call, force_write=is_batch, write_gate=write_gate)
+        return _annotate_batch(result, classifications, name=name) if is_batch else result
 
     downstream_failed = False
     try:
@@ -509,7 +597,7 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
                 if current != publication:
                     raise PublisherError("registry ownership changed before managed delete")
                 try:
-                    result = _call_downstream(args, next_call, force_write=is_batch)
+                    result = _call_downstream(args, next_call, force_write=is_batch, write_gate=write_gate)
                 except BaseException:
                     downstream_failed = True
                     raise
@@ -549,7 +637,7 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
                 original = skill_md.read_bytes()
                 original_mode = info.st_mode
             try:
-                result = _call_downstream(args, next_call, force_write=is_batch)
+                result = _call_downstream(args, next_call, force_write=is_batch, write_gate=write_gate)
             except BaseException:
                 downstream_failed = True
                 raise
@@ -573,7 +661,7 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
             )
             if digest_actions & {"edit", "patch", "write_file", "remove_file"}:
                 update_managed_digest(str(name), config=config, _locked=True)
-            return _annotate_batch(result, classifications) if is_batch else result
+            return _annotate_batch(result, classifications, name=name) if is_batch else result
     except Exception as exc:
         if downstream_failed:
             raise

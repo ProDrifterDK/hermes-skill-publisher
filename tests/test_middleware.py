@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 
@@ -39,10 +40,11 @@ def test_one_operation_batch_updates_managed_digest_and_calls_core_once(isolated
             "new_string": "Updated",
         }],
     }
+    expected = copy.deepcopy(args)
     calls = []
 
     def core(payload):
-        calls.append(payload)
+        calls.append(copy.deepcopy(payload))
         skill_md = target / "SKILL.md"
         skill_md.write_text(skill_md.read_text().replace("Body", "Updated"), encoding="utf-8")
         return json.dumps({"success": True, "operations_applied": 1})
@@ -50,10 +52,31 @@ def test_one_operation_batch_updates_managed_digest_and_calls_core_once(isolated
     before = load_registry()["publications"]["demo-skill"]["digest"]
     result = decode(intercept(tool_name="skill_manage", args=args, next_call=core))
     assert result["success"] is True
-    assert calls == [args]
+    assert args == expected
+    assert calls == [expected]
     after = load_registry()["publications"]["demo-skill"]["digest"]
     assert after != before
     assert after == package_digest_oracle(target)
+
+
+def test_permissive_batch_unclassified_create_audits_local_result(isolated_home):
+    from hermes_skill_publisher.state import read_audit
+
+    content = "---\nname: demo-skill\ndescription: test\n---\nBody\n"
+    result = decode(intercept(
+        tool_name="skill_manage",
+        args={"operations": [{"action": "create", "name": "demo-skill", "content": content}]},
+        next_call=lambda payload: json.dumps({"success": True, "operations_applied": 1}),
+    ))
+    assert result["success"] is True
+    assert result["skill_publisher"]["code"] == "skill_publisher.classification_missing"
+    assert any(
+        item.get("event") == "skill_publisher.local_unclassified"
+        and item.get("result") == "local"
+        and item.get("action") == "create"
+        and item.get("code") == "skill_publisher.classification_missing"
+        for item in read_audit(20)
+    )
 
 
 def test_batch_policy_rejects_invalid_topology_and_required_unclassified_create(isolated_home):
