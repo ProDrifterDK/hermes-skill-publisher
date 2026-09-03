@@ -417,8 +417,10 @@ def test_real_host_reset_fault_reconciles_digest_and_latches_writes(isolated_hom
     from hermes_skill_publisher.state import load_registry, read_audit
     from tools.registry import registry
     import contextvars
+    import inspect
     import tools.skill_manager_tool as skill_tool
 
+    supports_operations = "operations" in inspect.signature(skill_tool.skill_manage).parameters
     gate = skill_tool._skill_gate_bypass
     assert isinstance(gate, contextvars.ContextVar)
 
@@ -430,14 +432,13 @@ def test_real_host_reset_fault_reconciles_digest_and_latches_writes(isolated_hom
     manager.invoke_hook("on_session_end", session_id="e2e-reset-fault", completed=True, interrupted=False)
     target = isolated_home["shared"] / "demo-skill"
     before = load_registry()["publications"]["demo-skill"]["digest"]
-    payload = {
-        "operations": [{
-            "action": "patch",
-            "name": "demo-skill",
-            "old_string": "Body",
-            "new_string": "Updated",
-        }],
+    patch = {
+        "action": "patch",
+        "name": "demo-skill",
+        "old_string": "Body",
+        "new_string": "Updated",
     }
+    payload = {"operations": [patch]} if supports_operations else patch
     expected = copy.deepcopy(payload)
     calls = []
 
@@ -468,14 +469,13 @@ def test_real_host_reset_fault_reconciles_digest_and_latches_writes(isolated_hom
     )
     assert gate.get() is False
 
-    future_payload = {
-        "operations": [{
-            "action": "patch",
-            "name": "demo-skill",
-            "old_string": "Updated",
-            "new_string": "Future",
-        }],
+    future_patch = {
+        "action": "patch",
+        "name": "demo-skill",
+        "old_string": "Updated",
+        "new_string": "Future",
     }
+    future_payload = {"operations": [future_patch]} if supports_operations else future_patch
     future_calls = []
     future_result = json.loads(run_tool_execution_middleware(
         "skill_manage",
