@@ -540,9 +540,11 @@ def test_flat_write_file_non_string_content_rejected_before_core(isolated_home):
     assert calls == []
 
 
-def test_empty_content_overwrite_rejected_before_core(isolated_home, make_skill):
+def test_empty_content_overwrite_rejected_before_core(isolated_home, make_skill, monkeypatch):
+    import hermes_skill_publisher.plugin as plugin
     from hermes_skill_publisher.state import read_audit
     package = make_skill(isolated_home["local"])
+    monkeypatch.setattr(plugin, "_find_skill_dir", lambda name: {"path": package} if name == "demo-skill" else None)
     references = package / "references"
     references.mkdir()
     ref = references / "keep.md"
@@ -566,8 +568,10 @@ def test_empty_content_overwrite_rejected_before_core(isolated_home, make_skill)
     )
 
 
-def test_single_operation_batch_empty_overwrite_rejected(isolated_home, make_skill):
+def test_single_operation_batch_empty_overwrite_rejected(isolated_home, make_skill, monkeypatch):
+    import hermes_skill_publisher.plugin as plugin
     package = make_skill(isolated_home["local"])
+    monkeypatch.setattr(plugin, "_find_skill_dir", lambda name: {"path": package} if name == "demo-skill" else None)
     references = package / "references"
     references.mkdir()
     (references / "keep.md").write_text("original", encoding="utf-8")
@@ -584,8 +588,10 @@ def test_single_operation_batch_empty_overwrite_rejected(isolated_home, make_ski
     assert calls == []
 
 
-def test_empty_content_into_new_or_empty_file_still_passes(isolated_home, make_skill):
+def test_empty_content_into_new_or_empty_file_still_passes(isolated_home, make_skill, monkeypatch):
+    import hermes_skill_publisher.plugin as plugin
     package = make_skill(isolated_home["local"])
+    monkeypatch.setattr(plugin, "_find_skill_dir", lambda name: {"path": package} if name == "demo-skill" else None)
     references = package / "references"
     references.mkdir()
     (references / "empty.md").write_text("", encoding="utf-8")
@@ -611,3 +617,17 @@ def test_empty_content_into_new_or_empty_file_still_passes(isolated_home, make_s
     ))
     assert result == {"success": True}
     assert len(calls) == 3
+
+
+def test_empty_overwrite_unresolvable_target_passes_to_core(isolated_home, monkeypatch):
+    """Host-free lanes have no skill discovery; the guard defers to core instead of guessing."""
+    import hermes_skill_publisher.plugin as plugin
+    monkeypatch.setattr(plugin, "_find_skill_dir", lambda name: None)
+    calls = []
+    result = decode(intercept(
+        tool_name="skill_manage",
+        args={"action": "write_file", "name": "demo-skill", "file_path": "references/keep.md", "file_content": ""},
+        next_call=lambda payload: calls.append(payload) or json.dumps({"success": True}),
+    ))
+    assert result == {"success": True}
+    assert len(calls) == 1

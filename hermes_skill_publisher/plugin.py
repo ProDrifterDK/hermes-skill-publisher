@@ -92,6 +92,25 @@ def _validate_flat_write_file(args: dict[str, Any]) -> None:
         raise _BatchShapeError("write_file requires string file_content")
 
 
+def _find_skill_dir(name: str) -> dict[str, Any] | None:
+    """Best-effort skill lookup through the host tooling.
+
+    Returns the host ``_find_skill`` mapping (``{"path": Path}``) or ``None`` when
+    the capability is unavailable. The empty-overwrite guard treats ``None`` as
+    "cannot prove this write is destructive" and leaves the decision to core
+    validation; unit lanes run without a host and inject this seam directly.
+    """
+    try:
+        from tools import skill_manager_tool as _skill_manager
+        finder = getattr(_skill_manager, "_find_skill", None)
+        if callable(finder):
+            found = finder(name)
+            return found if isinstance(found, dict) else None
+    except Exception:
+        return None
+    return None
+
+
 def _empty_overwrite_target(operations: tuple[dict[str, Any], ...]) -> tuple[str, str] | None:
     """``(name, file_path)`` of an empty-content write_file that would blank an existing file.
 
@@ -116,17 +135,10 @@ def _empty_overwrite_target(operations: tuple[dict[str, Any], ...]) -> tuple[str
         break
     if target is None:
         return None
-    try:
-        from tools import skill_manager_tool as _skill_manager
-        find_skill = getattr(_skill_manager, "_find_skill", None)
-    except Exception:
-        return None
-    if not callable(find_skill):
+    found = _find_skill_dir(target[0])
+    if not found or not found.get("path"):
         return None
     try:
-        found = find_skill(target[0])
-        if not isinstance(found, dict) or not found.get("path"):
-            return None
         skill_dir = Path(found["path"])
         candidate = Path(os.path.normpath(skill_dir / target[1]))
         if candidate != skill_dir and skill_dir not in candidate.parents:
