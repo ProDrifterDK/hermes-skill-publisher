@@ -211,6 +211,8 @@ def test_published_skill_md_file_actions_are_rolled_back(isolated_home, make_ski
         return json.dumps({"success": True})
 
     args = {"action": action, "name": "demo-skill", "file_path": "SKILL.md"}
+    if action == "write_file":
+        args["file_content"] = skill_text("demo-skill", "local")
     result = decode(intercept(tool_name="skill_manage", args=args, next_call=core))
     assert result["code"] == "skill_publisher.scope_change_requires_unpublish"
     assert skill_md.read_text() == original
@@ -253,7 +255,7 @@ def test_published_support_write_updates_registry_digest(isolated_home, make_ski
         (target / "references").mkdir()
         (target / "references" / "x.md").write_text("x")
         return json.dumps({"success": True})
-    intercept(tool_name="skill_manage", args={"action": "write_file", "name": "demo-skill", "file_path": "references/x.md"}, next_call=core)
+    intercept(tool_name="skill_manage", args={"action": "write_file", "name": "demo-skill", "file_path": "references/x.md", "file_content": "x"}, next_call=core)
     assert load_registry()["publications"]["demo-skill"]["digest"] != before
 
 
@@ -512,3 +514,100 @@ def test_malformed_yaml_sentinel_never_persisted(isolated_home, capsys):
     )
     audit_text = json.dumps(read_audit(50))
     assert sentinel not in audit_text
+
+
+def test_flat_write_file_without_content_rejected_before_core(isolated_home):
+    calls = []
+    result = decode(intercept(
+        tool_name="skill_manage",
+        args={"action": "write_file", "name": "demo-skill", "file_path": "references/x.md"},
+        next_call=lambda payload: calls.append(payload) or pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.operation_shape_invalid"
+    assert result["retryable"] is True
+    assert result["skill_publisher"]["field"] == "file_content"
+    assert calls == []
+
+
+def test_flat_write_file_non_string_content_rejected_before_core(isolated_home):
+    calls = []
+    result = decode(intercept(
+        tool_name="skill_manage",
+        args={"action": "write_file", "name": "demo-skill", "file_path": "references/x.md", "file_content": None},
+        next_call=lambda payload: calls.append(payload) or pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.operation_shape_invalid"
+    assert calls == []
+
+
+def test_empty_content_overwrite_rejected_before_core(isolated_home, make_skill):
+    from hermes_skill_publisher.state import read_audit
+    package = make_skill(isolated_home["local"])
+    references = package / "references"
+    references.mkdir()
+    ref = references / "keep.md"
+    ref.write_text("original content", encoding="utf-8")
+    calls = []
+    result = decode(intercept(
+        tool_name="skill_manage",
+        args={"action": "write_file", "name": "demo-skill", "file_path": "references/keep.md", "file_content": ""},
+        next_call=lambda payload: calls.append(payload) or pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.empty_overwrite_blocked"
+    assert result["retryable"] is True
+    assert result["skill_publisher"]["field"] == "file_content"
+    assert ref.read_text() == "original content"
+    assert calls == []
+    assert any(
+        item.get("event") == "skill_publisher.empty_overwrite_blocked"
+        and item.get("skill_name") == "demo-skill"
+        and item.get("action") == "write_file"
+        for item in read_audit(20)
+    )
+
+
+def test_single_operation_batch_empty_overwrite_rejected(isolated_home, make_skill):
+    package = make_skill(isolated_home["local"])
+    references = package / "references"
+    references.mkdir()
+    (references / "keep.md").write_text("original", encoding="utf-8")
+    calls = []
+    result = decode(intercept(
+        tool_name="skill_manage",
+        args={"operations": [{
+            "action": "write_file", "name": "demo-skill",
+            "file_path": "references/keep.md", "file_content": "",
+        }]},
+        next_call=lambda payload: calls.append(payload) or pytest.fail("core called"),
+    ))
+    assert result["code"] == "skill_publisher.empty_overwrite_blocked"
+    assert calls == []
+
+
+def test_empty_content_into_new_or_empty_file_still_passes(isolated_home, make_skill):
+    package = make_skill(isolated_home["local"])
+    references = package / "references"
+    references.mkdir()
+    (references / "empty.md").write_text("", encoding="utf-8")
+    (references / "keep.md").write_text("original", encoding="utf-8")
+    calls = []
+
+    def core(payload):
+        calls.append(payload)
+        return json.dumps({"success": True})
+
+    for file_path in ("references/new.md", "references/empty.md"):
+        result = decode(intercept(
+            tool_name="skill_manage",
+            args={"action": "write_file", "name": "demo-skill", "file_path": file_path, "file_content": ""},
+            next_call=core,
+        ))
+        assert result == {"success": True}
+    # Non-empty content over a non-empty file is not this guard's business.
+    result = decode(intercept(
+        tool_name="skill_manage",
+        args={"action": "write_file", "name": "demo-skill", "file_path": "references/keep.md", "file_content": "updated"},
+        next_call=core,
+    ))
+    assert result == {"success": True}
+    assert len(calls) == 3

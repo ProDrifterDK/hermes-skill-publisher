@@ -13,6 +13,7 @@ The plugin follows these non-negotiable rules:
 9. Shared/config/adapter paths are re-resolved for every callback. No active profile path is cached at import.
 10. Hermes configuration is read-only to this plugin.
 11. Audit/status/doctor never echo raw durable records or unvalidated skill/action strings; invalid records use stable codes and safe identifiers.
+12. A skill mutation passing through this middleware never blanks existing content: a content-less `write_file` shape is rejected in both the `operations` and legacy flat envelopes (`skill_publisher.operation_shape_invalid`), and an empty payload against an existing non-empty file fails closed before core (`skill_publisher.empty_overwrite_blocked`).
 
 ## No-replace release gate
 

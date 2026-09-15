@@ -21,6 +21,7 @@ _AUDIT_EVENTS = frozenset({
     "skill_publisher.commit_cleanup_pending",
     "skill_publisher.create_rejected",
     "skill_publisher.deleted",
+    "skill_publisher.empty_overwrite_blocked",
     "skill_publisher.invalid_event",
     "skill_publisher.lifecycle_barrier",
     "skill_publisher.lifecycle_blocked",

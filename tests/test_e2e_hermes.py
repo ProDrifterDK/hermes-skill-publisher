@@ -486,3 +486,51 @@ def test_real_host_reset_fault_reconciles_digest_and_latches_writes(isolated_hom
     assert future_result["code"] == "skill_publisher.policy_unavailable"
     assert future_calls == []
     assert module.write_gate_bypass_available() is False
+
+
+@pytest.mark.e2e
+def test_real_host_content_loss_guards_block_before_core(isolated_home, monkeypatch):
+    """Content-less and empty write_file payloads never reach the real host core."""
+    source, manager = _hermes_host(isolated_home, monkeypatch)
+    from hermes_cli.middleware import run_tool_execution_middleware
+    from hermes_skill_publisher.state import read_audit
+    from tools.skill_manager_tool import skill_manage
+
+    def dispatch(payload):
+        return skill_manage(**payload)
+
+    create = {"action": "create", "name": "demo-skill", "content": skill_text("demo-skill")}
+    assert json.loads(run_tool_execution_middleware("skill_manage", create, dispatch))["success"]
+    support = {"action": "write_file", "name": "demo-skill", "file_path": "references/keep.md", "file_content": "ORIGINAL"}
+    assert json.loads(run_tool_execution_middleware("skill_manage", support, dispatch))["success"]
+    ref = isolated_home["local"] / "demo-skill" / "references" / "keep.md"
+    assert ref.read_text() == "ORIGINAL"
+
+    calls = []
+
+    def counting_dispatch(payload):
+        calls.append(copy.deepcopy(payload))
+        return dispatch(payload)
+
+    missing = {"action": "write_file", "name": "demo-skill", "file_path": "references/keep.md"}
+    result = json.loads(run_tool_execution_middleware("skill_manage", missing, counting_dispatch))
+    assert result["success"] is False
+    assert result["code"] == "skill_publisher.operation_shape_invalid"
+    assert ref.read_text() == "ORIGINAL"
+
+    empty = {"action": "write_file", "name": "demo-skill", "file_path": "references/keep.md", "file_content": ""}
+    result = json.loads(run_tool_execution_middleware("skill_manage", empty, counting_dispatch))
+    assert result["success"] is False
+    assert result["code"] == "skill_publisher.empty_overwrite_blocked"
+    assert ref.read_text() == "ORIGINAL"
+
+    create_empty = {"action": "write_file", "name": "demo-skill", "file_path": "references/new-empty.md", "file_content": ""}
+    result = json.loads(run_tool_execution_middleware("skill_manage", create_empty, counting_dispatch))
+    assert result["success"] is True
+    assert (isolated_home["local"] / "demo-skill" / "references" / "new-empty.md").exists()
+    assert calls == [create_empty]
+    assert any(
+        item.get("event") == "skill_publisher.empty_overwrite_blocked"
+        and item.get("skill_name") == "demo-skill"
+        for item in read_audit(50)
+    )

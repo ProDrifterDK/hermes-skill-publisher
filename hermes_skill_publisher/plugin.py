@@ -48,6 +48,117 @@ def _batch_rejection(message: str) -> str:
     )
 
 
+def _shape_rejection(message: str, *, flat: bool) -> str:
+    """Reject a malformed mutation envelope before core.
+
+    Batch envelopes teach the operations-array contract; the legacy flat envelope
+    teaches the complete-operation contract for the one op this middleware validates.
+    """
+    if not flat:
+        return _batch_rejection(message)
+    return json.dumps(
+        {
+            "success": False,
+            "error": message,
+            "code": "skill_publisher.operation_shape_invalid",
+            "retryable": True,
+            "skill_publisher": {
+                "retry_action": (
+                    "Re-emit the flat skill_manage call with the complete operation: "
+                    "write_file needs both file_path and a string file_content."
+                ),
+                "field": "file_content",
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+def _validate_flat_write_file(args: dict[str, Any]) -> None:
+    """Enforce the batch write_file contract on the legacy flat envelope.
+
+    Flat calls bypass ``operations`` shape validation, so a dropped or non-string
+    ``file_content`` (the weak-model retry pattern behind repeated content-less
+    writes) would only be caught by core. Enforce it here so the publisher write
+    path refuses content-less writes before anything can run.
+    """
+    if args.get("action") != "write_file":
+        return
+    if not isinstance(args.get("name"), str) or not args.get("name"):
+        raise _BatchShapeError("write_file requires a string name")
+    if not isinstance(args.get("file_path"), str) or not args.get("file_path"):
+        raise _BatchShapeError("write_file requires file_path")
+    if not isinstance(args.get("file_content"), str):
+        raise _BatchShapeError("write_file requires string file_content")
+
+
+def _empty_overwrite_target(operations: tuple[dict[str, Any], ...]) -> tuple[str, str] | None:
+    """``(name, file_path)`` of an empty-content write_file that would blank an existing file.
+
+    A missing ``file_content`` is a shape error; this covers the explicitly empty
+    string, which core accepts and which destroys the current file content. Discovery
+    is best-effort: when the skill or file cannot be resolved the guard stays out of
+    the way and core's own validation proceeds — it never blocks a write it cannot
+    prove is destructive.
+    """
+    target: tuple[str, str] | None = None
+    for operation in operations:
+        if operation.get("action") != "write_file" or operation.get("file_content") != "":
+            continue
+        op_name, op_path = operation.get("name"), operation.get("file_path")
+        if not isinstance(op_name, str) or not op_name:
+            continue
+        if not isinstance(op_path, str) or not op_path:
+            continue
+        if Path(op_path).is_absolute() or ".." in Path(op_path).parts:
+            continue
+        target = (op_name, op_path)
+        break
+    if target is None:
+        return None
+    try:
+        from tools import skill_manager_tool as _skill_manager
+        find_skill = getattr(_skill_manager, "_find_skill", None)
+    except Exception:
+        return None
+    if not callable(find_skill):
+        return None
+    try:
+        found = find_skill(target[0])
+        if not isinstance(found, dict) or not found.get("path"):
+            return None
+        skill_dir = Path(found["path"])
+        candidate = Path(os.path.normpath(skill_dir / target[1]))
+        if candidate != skill_dir and skill_dir not in candidate.parents:
+            return None
+        if candidate.is_symlink() or not candidate.is_file() or candidate.stat().st_size == 0:
+            return None
+    except Exception:
+        return None
+    return target
+
+
+def _empty_overwrite_rejection(name: str, file_path: str) -> str:
+    return json.dumps(
+        {
+            "success": False,
+            "error": (
+                f"Refusing to overwrite non-empty file '{file_path}' of skill '{name}' with EMPTY content. "
+                "An empty file_content payload is treated as a dropped write and would destroy the file. "
+                "Read the file and re-send its full content, use action='patch' for a targeted edit, or "
+                "action='remove_file' to delete it."
+            ),
+            "code": "skill_publisher.empty_overwrite_blocked",
+            "retryable": True,
+            "skill_publisher": {
+                "retry_action": "Re-send the complete file content, patch the file, or remove it.",
+                "field": "file_content",
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
 def _parse_skill_manage_args(
     args: Any,
 ) -> tuple[bool, tuple[dict[str, Any], ...], Any, Any]:
@@ -61,6 +172,7 @@ def _parse_skill_manage_args(
     if not isinstance(args, dict):
         raise _BatchShapeError("skill_manage arguments must be an object")
     if "operations" not in args:
+        _validate_flat_write_file(args)
         return False, (args,), args.get("action"), args.get("name")
 
     # The current schema has no flat fields. Empty defaults and the host's
@@ -475,13 +587,18 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
     try:
         is_batch, operations, action, name = _parse_skill_manage_args(args)
     except _BatchShapeError as exc:
+        flat = isinstance(args, dict) and "operations" not in args
+        blocked_name = args.get("name") if flat else None
+        blocked_action = args.get("action") if flat else None
         _audit_safe(
             "skill_publisher.managed_mutation_blocked",
             result="blocked",
             error=str(exc),
-            code="skill_publisher.batch_unsupported",
+            code=("skill_publisher.operation_shape_invalid" if flat else "skill_publisher.batch_unsupported"),
+            skill_name=blocked_name if isinstance(blocked_name, str) else None,
+            action=blocked_action if isinstance(blocked_action, str) else None,
         )
-        return _batch_rejection(str(exc))
+        return _shape_rejection(str(exc), flat=flat)
 
     # The host falls through to the core tool when a middleware callback
     # raises before next_call, so the entire policy surface is resolved inside
@@ -509,6 +626,20 @@ def intercept(*, tool_name: str, args: dict[str, Any], next_call: Callable[[dict
     if approval_gate and write_action:
         _audit_safe("skill_publisher.write_approval_incompatible", result="blocked", skill_name=name, action=action, code="skill_publisher.write_approval_incompatible")
         return _write_approval_rejection()
+
+    # Content-loss guard: core accepts an explicitly EMPTY write_file payload and blanks the
+    # target file, so refuse before core when it would destroy existing content.
+    if write_action and (overwrite_target := _empty_overwrite_target(operations)) is not None:
+        blocked_name, blocked_path = overwrite_target
+        _audit_safe(
+            "skill_publisher.empty_overwrite_blocked",
+            result="blocked",
+            error="empty write_file payload would blank an existing non-empty skill file",
+            skill_name=blocked_name,
+            action="write_file",
+            code="skill_publisher.empty_overwrite_blocked",
+        )
+        return _empty_overwrite_rejection(blocked_name, blocked_path)
 
     classifications: list[Any] = []
     if is_batch:

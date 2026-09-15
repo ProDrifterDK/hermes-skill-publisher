@@ -13,5 +13,5 @@
 - Removing an adapter from configuration does not silently remove an old owned link. Unpublish is the explicit cleanup path.
 - Direct external edits are diagnosed, not automatically moved or rewritten.
 - Adapter links provide discovery only. Instruction syntax and named tool compatibility remain the operator's responsibility.
-- No network sync, Git integration, registry upload, UI, daemon, or content secret classifier is included. Current Hermes `skill_manage` operations batches are supported only as one operation targeting one skill; multi-operation or multi-skill batches are rejected before core.
+- No network sync, Git integration, registry upload, UI, daemon, or content secret classifier is included. Current Hermes `skill_manage` operations batches are supported only as one operation targeting one skill; multi-operation or multi-skill batches are rejected before core. The empty-overwrite guard resolves its target through Hermes skill discovery; when the skill or file cannot be resolved it stays out of the way and core's own validation decides.
 - Uninstall is non-destructive: canonical packages, links, and profile-scoped state are not automatically deleted.
