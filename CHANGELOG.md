@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [0.1.2] - 2026-11-05
+
+### Added
+
+- Python 3.14 support: `requires-python` widened to `>=3.11,<3.15`, the 3.14 classifier, and a 3.14 CI lane. The full suite passes on CPython 3.14.9, including the Linux `renameat2(RENAME_NOREPLACE)` atomic-rename path.
+
 ## [0.1.1] - 2026-08-10
 
 ### Fixed
