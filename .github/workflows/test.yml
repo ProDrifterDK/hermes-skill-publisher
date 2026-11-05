@@ -46,11 +46,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.14" # Hermes main supports CPython 3.14 only.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent
           ref: main # Intentionally floating compatibility lane only.
           path: _hermes-agent
-      - run: python -m pip install -e '.[test]' -e ./_hermes-agent
+      # Hermes installs itself with uv: pip cannot resolve its core pins
+      # (browser-harness 0.1.13 pins pillow==12.3.0, Hermes pins Pillow 13.0.0),
+      # which Hermes resolves through [tool.uv].override-dependencies. uv applies
+      # those overrides when the install runs inside the Hermes checkout.
+      - run: python -m pip install uv==0.13.5
+      - run: cd _hermes-agent && uv pip install --system -e "$GITHUB_WORKSPACE[test]" -e .
       - run: HERMES_AGENT_SOURCE="$PWD/_hermes-agent" python -m pytest -q tests/test_e2e_hermes.py

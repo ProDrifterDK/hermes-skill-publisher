@@ -2,6 +2,12 @@
 
 All notable changes are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- The `hermes-current-main` CI lane now runs on CPython 3.14, the only Python Hermes `main` supports, so Hermes's runtime dependencies are actually installed, and installs Hermes with `uv` from the checkout so its own `[tool.uv].override-dependencies` resolve the `browser-harness`/Pillow pin that plain `pip` rejects. The E2E schema check accepts both advertised `skill_manage` batch shapes: one object (older hosts) and per-action `anyOf` branches (current `main`).
+
 ## [0.1.2] - 2026-11-05
 
 ### Added

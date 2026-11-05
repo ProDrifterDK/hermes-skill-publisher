@@ -106,12 +106,21 @@ def test_real_host_one_operation_batch_updates_managed_digest(isolated_home, mon
     assert set(parameters["properties"]) == {"operations"}
     operations_schema = parameters["properties"]["operations"]
     assert operations_schema["type"] == "array"
-    operation_schema = operations_schema["items"]
-    assert operation_schema["type"] == "object"
-    assert operation_schema["required"] == ["name", "action"]
-    assert operation_schema["properties"]["action"]["enum"] == [
+    # Hosts advertise the batch as either one object shape (older Hermes) or, on
+    # current main, per-action anyOf branches. Both must stay arrays of objects
+    # that name the skill and the action.
+    item_schema = operations_schema["items"]
+    branches = item_schema.get("anyOf") or [item_schema]
+    advertised = set()
+    for branch in branches:
+        assert branch["type"] == "object"
+        assert {"name", "action"} <= set(branch["required"])
+        action_schema = branch["properties"]["action"]
+        assert action_schema["type"] == "string"
+        advertised.update(action_schema["enum"])
+    assert advertised == {
         "create", "patch", "delete", "write_file", "remove_file",
-    ]
+    }
 
     create = {"action": "create", "name": "demo-skill", "content": skill_text("demo-skill")}
     def dispatch(payload):
